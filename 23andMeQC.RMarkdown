@@ -1,0 +1,172 @@
+---
+title: "23andMe Imputation QC"
+author: "Robert Steinfelder"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(dev="CairoPNG")
+```
+
+## Impact of Missingness on Single Sample Imputated Direct To Consumer Genotyping Data
+
+The purpose of this work is to track our work investigating the relationship 
+between PRS, imputation $Rsq$, missingness and MAF from 54 23andMe samples randomly 
+selected from [Personal Genome Project](https://my.pgp-hms.org/public_genetic_data?data_type=23andMe).
+ 
+The 54 23andMe genotyping files were pre-processed (individually):
+1) Converting 23andMe to VCF
+2) Subset SNPs to chr1-chr22 and filter InDels and missing SNPs
+3) Pre-phase with Eagle2
+4) Imputation with Minimac4
+5) Subset SNPs to PRS SNPs
+
+### PCA plot with 1000 Genomes
+
+First 2 PCs of imputed VCF files were plotted with 1000Genomes cohort to check 
+population structure, detect potential outliers and to see if there are 
+potential issues with imputation. 
+
+```{r}
+library(ggplot2)
+sf = read.table("/fh/fast/peters_u/GECCO_Working/robert_working/Projects/Webtool_PRS/Test/calibrate/PRS_Summary_from_Prototype_w_for_validation_adjusted_wPCs_Apr28_2025.tsv", header=T, sep='\t')
+
+pc1kg = read.table("/fh/fast/peters_u/GECCO_Working/mintaworking/RS_Project/pcs_1000G/1000G_PCA.txt",
+        header=T, sep='\t')
+pcp = data.frame(PC1=c(pc1kg$PC1, sf$PC1),
+                 PC2=c(pc1kg$PC2, sf$PC2),
+                 race=c(pc1kg$race, rep("23andMe", nrow(sf))))
+ggplot(pcp, aes(x=PC1, y=PC2, color=race)) + geom_point() + theme_minimal()
+
+```
+
+The plot shows no clear outliers, however, it's surprising that no samples
+cluster with white/EUR. They are all in the admixed american (AMR/Latino) samples. 
+This could indicate a bias introduced from single sample imputation. 
+
+### Missingness and Imputation $Rsq$
+
+Next, we check for missingness in each sample and if there is an affect on $Rsq$.
+```{r}
+results = read.table("/fh/fast/peters_u/GECCO_Working/robert_working/nextflow/FH-PRS-tool-example/inputQC/23andMe_imputation_stats_Apr28_2025.tsv", header=T, 
+                     sep='\t')
+ggplot(results, aes(x=n.SNP, y=pct.NA)) + geom_point() + theme_minimal()
+```
+
+Missingness ranges between 1-3.5%. Furthermore, 
+there seems to be about 3 different SNP counts (~600k, ~950k, ~1.3M). 
+This is explained by the differently sized microarray chips that were used by 23andMe. 
+We will plot samples with chip size, to easier spot potential batch effects. 
+
+```{r}
+results$chip = ifelse(results$n.SNP < 750000, "600k", ifelse(results$n.SNP < 1000000, "950k", "1.3m"))
+table(results$chip)
+```
+
+Let's compare percent missingness to mean $Rsq$:
+
+```{r}
+p = ggplot(results, aes(x=pct.NA, y=R2.mean, color=chip)) + geom_point() + theme_minimal()
+plot(p)
+```
+
+- Missingness of > 1.5% does seem to have an impact on samples genotyped on small chips 
+(600k SNPs). 
+- There is also one sample with low missingness (< 1%) but a much
+lower $Rsq$ (< 0.1). The sample (FID: genome_23-And-Me) should be further
+investigated and is a candidate to drop. 
+
+Next, we check if missingness or $Rsq$ has an impact on PRS. 
+
+```{r}
+p = ggplot(results, aes(x=pct.NA, y=PRS.raw, color=chip)) + geom_point() + theme_minimal()
+plot(p)
+p = ggplot(results, aes(x=R2.mean, y=PRS.raw, color=chip)) + geom_point() + theme_minimal()
+plot(p)
+```
+
+Neither percent missingness or mean $Rsq$ 
+correlate with PRS. However, PRS could still be biased (e.g., towards
+the population mean), which wouldn't be observed here.
+
+Imputation $Rsq$ is defined as:
+
+$Rsq = \frac{Var(posterior\ dosage)}{Var(true\ genotypes)}$
+
+The denominator is usually estimated from the imputed cohort [Binary Dosage] (https://cran.r-project.org/web/packages/BinaryDosage/vignettes/r2estimates.html).
+In single sample imputation, though, it is estimated from the reference
+population -in our case, the 1000 genomes cohort. For monomorphic SNPs or SNPs 
+with low MAF this could lead to problems, since the denominator can get very 
+small causing unstable $Rsq$.  
+
+### Imputation $Rsq$ and MAF
+
+To visualize this, let's plot MAF vs $Rsq$ for chr1 of sample 912014genome_Full_20140901163652:
+
+```{r}
+library(vcfR)
+library(ggExtra)
+makeMutID <- function(vcf){
+        if(nrow(vcf@fix) > 1){
+                return(paste(paste(apply(vcf@fix[,c("CHROM", "POS")], MARGIN=1, paste, collapse=":"),
+                vcf@fix[,c("REF")], sep=":"), vcf@fix[,c("ALT")], sep=":"))
+        }
+        if(nrow(vcf@fix) == 1){
+                return(paste(paste(paste(vcf@fix[,c("CHROM", "POS")], collapse=":"),
+                vcf@fix[,c("REF")], sep=":"), vcf@fix[,c("ALT")], sep=":"))
+        }
+                return()
+}
+
+ids = results$FID
+i = 1
+chr = 1
+prssnps = read.table("/fh/fast/peters_u/GECCO_Working/robert_working/nextflow/FH-PRS-tool-example/NF_Sam/ref/trans_prs_Nov_19.txt",
+        header=T, sep='\t')
+
+vcf_path = paste0("/fh/fast/peters_u/GECCO_Working/robert_working/nextflow/FH-PRS-tool-example/prs_prototype_test/output/", ids[i], ".imputed.chr", chr, ".vcf.gz")
+vcf = read.vcfR(vcf_path, verbose = FALSE)
+mid = makeMutID(vcf)
+vcf = vcf[ mid %in% prssnps$newid,]
+mid = makeMutID(vcf)
+vcf@fix[,"ID"] = mid
+r2 = extract.info(vcf, element="R2", as.numeric=T)
+maf = extract.info(vcf, element="MAF", as.numeric=T)
+gt = extract.gt(vcf, element = "GT")
+vstats = data.frame(maf=maf, r2=r2, gt=gt)
+p = ggplot(vstats, aes(x=maf, y=r2, color=gt)) + geom_point(pch=1) + theme_minimal()
+plot(ggMarginal(p, type = "histogram"))
+
+```
+
+- The marginal scatterplot shows ~20% of (PRS) SNPs to have a MAF < 0.01.
+These could have an unreliable or deflated $Rsq$. 
+- Homozygous SNPs (red/purple), especially with a low MAF show a lower $Rsq$.
+- Heterozygous SNPs (green/blue) with high MAF have a low $Rsq$.
+
+We can likely explain the low mean $Rsq$ from the rare or monomorphic SNPs. 
+This does not show SNPs are improperly imputed and it was shown before
+that single sample imputation does not strongly impact
+PRS. We have shown that
+
+- Low missing rate can still lead to low $Rsq$.  
+- High missingrate (>1.5%) causes a lower $Rsq$ in 23andMe samples from 600k chips
+- $Rsq$ is likely deflated due to single sample imputation
+
+Questions:
+
+- What causes a sample to have an $Rsq < 0.1$ with low missingness?
+- Is the shift of samples in the PC plot caused by single sample imputation and 
+is it a concern? 
+- Can we boost imputation quality and $Rsq$ by imputing several 23andMe 
+samples together? Does this affect PRS?
+- What is the range of $Rsq$
+
+## Cohort Imputation of 23andMe and $Rsq$
+
+23andMe files are merged and split by chromosome before phased with Eagle2 
+and imputation with Minimac4.1.6. 
+
+
