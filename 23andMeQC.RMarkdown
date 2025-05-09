@@ -135,6 +135,7 @@ vcf@fix[,"ID"] = mid
 r2 = extract.info(vcf, element="R2", as.numeric=T)
 maf = extract.info(vcf, element="MAF", as.numeric=T)
 gt = extract.gt(vcf, element = "GT")
+ds = extract.gt(vcf, element = "DS")
 vstats = data.frame(maf=maf, r2=r2, gt=gt)
 p = ggplot(vstats, aes(x=maf, y=r2, color=gt)) + geom_point(pch=1) + theme_minimal()
 plot(ggMarginal(p, type = "histogram"))
@@ -157,16 +158,186 @@ PRS. We have shown that
 
 Questions:
 
-- What causes a sample to have an $Rsq < 0.1$ with low missingness?
-- Is the shift of samples in the PC plot caused by single sample imputation and 
-is it a concern? 
-- Can we boost imputation quality and $Rsq$ by imputing several 23andMe 
+__Q1__: What causes a sample to have an $Rsq < 0.1$ with low missingness?
+
+__A1__: (in progress)
+
+__Q2__: Is the shift of samples in the PC plot caused by single sample imputation and 
+is it a concern?
+
+__A2__: Minta pointed out that the shift is expected and caused by the fact that
+principal components are computed from external SNP loadings [Price et al, 2010]. 
+
+__Q3__: Can we boost imputation quality and $Rsq$ by imputing several 23andMe 
 samples together? Does this affect PRS?
-- What is the range of $Rsq$
 
-## Cohort Imputation of 23andMe and $Rsq$
+__A3__: This is discussed in [the next section](#cohort-imputation-of-23andme-and-rsq).
 
-23andMe files are merged and split by chromosome before phased with Eagle2 
-and imputation with Minimac4.1.6. 
+__Q4__: What is the range of $Rsq$ for a given MAF
 
+__A4__:For a MAF between 0.28 and 0.32 the range of $Rsq$ is (0,0.47). There seems 
+to be an upper limit dependant on MAF. 
+```{r}
+summary(r2[which(maf > 0.28 & maf < 0.32)])
+```
+Since the denominator in the $Rsq$ calculation -i.e., $Var(true\ genotype)$-
+is almost 1 for rare genotypes 
+(there are very few observations in the reference cohort) the $Rsq$ is 
+largely described by the variance of the estimated dosage. (to be discussed??) 
+
+## Batch Imputation of 23andMe and $Rsq$
+
+A batch of 50 23andMe files are merged and split by chromosome before phased with Eagle2 
+and imputation with Minimac4.1.6. MAF and R2 of batch-imputed genotypes showed 
+a very different pattern. Marginal plot of chr1 of the same sample from above 
+was plotted with new $Rsq$ estimates:
+
+```{r}
+id = "912014genome_Full_20140901163652"
+vcf_path = "/fh/fast/peters_u/GECCO_Working/robert_working/nextflow/FH-PRS-tool-example/inputQC/23andMe_impute/vcf/"
+vcf2 = read.vcfR(paste0(vcf_path, "chr1.imputed.vcf.gz"), verbose=F)
+mid2 = makeMutID(vcf2)
+vcf2 = vcf2[ mid2 %in% prssnps$newid,]
+mid2 = makeMutID(vcf2)
+vcf2@fix[,"ID"] = mid2
+r22 = extract.info(vcf2, element="R2", as.numeric=T)
+maf2 = extract.info(vcf2, element="MAF", as.numeric=T)
+gt2 = extract.gt(vcf2, element = "GT")[,id]
+ds2 = extract.gt(vcf2, element = "DS")[,id]
+
+vstats = data.frame(maf=maf2, r2=r22, gt=gt2)
+p = ggplot(vstats, aes(x=maf, y=r2, color=gt)) + geom_point(pch=1) + theme_minimal()
+plot(ggMarginal(p, type = "histogram"))
+
+print(mean(r22))
+
+```
+
+$Rsq$ estimates appear much higher with batch imputation. Hard to impute variants -e.g., low MAF
+- are of low quality/$Rsq$, as expected. Variants with MAF > 0.01 show a noticeably higher
+$Rsq$ than from single sample imputation. Mean $Rsq$ exceeds 0.96 for this sample and chromosome.
+Dosage correlation is investigated for the sample and chromosome with a hexplot:
+
+```{r}
+dstats = data.frame(cohort=as.numeric(ds), single=as.numeric(ds2))
+colnames(dstats) = c("cohort", "single")
+rownames(dstats) = NULL
+ggplot(dstats, aes(x=cohort, y=single)) + geom_hex(bins=60) + scale_fill_viridis_c() + theme_minimal()
+cor(dstats$cohort, dstats$single)
+
+discordant_by_threshold <- function(x, y, threshold = 1) {
+  diff <- abs(x - y)
+  sum(diff > threshold)
+}
+
+d = discordant_by_threshold(dstats$cohort, dstats$single, threshold = 0.2)
+print(d/nrow(dstats))
+
+```
+
+There are sporadic discordant dosages with ~7% of SNPs where 
+$\lvert dosage_{batch} - dosage_{single}\rvert > 0.2$
+
+This is expected, we have previously observed this when comparing 
+single sample imputed to batch imputed samples from the GenomeQuebec cohort.
+
+We should check correlation of raw PRS of the the two sets (single sample vs batch).
+
+
+```{r}
+# This has been pre-computed
+vcf_path = "/fh/fast/peters_u/GECCO_Working/robert_working/nextflow/FH-PRS-tool-example/inputQC/23andMe_impute/vcf/"
+
+loadBatchVcf = function(chr, vcf_path){
+
+  vcf = fread(paste0(vcf_path, 'chr', chr,'.imputed.vcf.gz'),
+              showProgress=F, nThread=1, data.table=FALSE)
+  return(vcf)
+}
+
+#Pre-computed
+#vcfs = mclapply(1:22, loadBatchVcf, vcf_path=vcf_path, mc.cores=16)
+
+calc_prs = function(vcf, ids, prssnps_chr){
+
+        idx = match(prssnps_chr$newid, paste0(vcf$ID,':',vcf$REF,':', vcf$ALT))
+        tmp = vcf[idx,]
+        scores = rep(NA, length(ids))
+        for(i in 1:length(ids)){
+                id = ids[i]
+                tpp = tmp[,c(1:9, which(colnames(tmp) == id))]
+                tp = str_split_fixed(tpp$FORMAT, ":", n=4)
+                tp1 = str_split_fixed(tpp[,id], ":", n=4)
+                idx1=which(tp[,1]=='DS')
+                idx2=which(tp[,2]=='DS')
+                idx3=which(tp[,3]=='DS')
+                idx4=which(tp[,4]=='DS')
+                fprs=rep(0,nrow(tp))
+
+                if(length(idx1)!=0){
+                        fprs[idx1]=as.numeric(tp1[idx1,1])
+                }
+
+                if(length(idx2)!=0){
+                        fprs[idx2]=as.numeric(tp1[idx2,2])
+                }
+
+                if(length(idx3)!=0){
+                        fprs[idx3]=as.numeric(tp1[idx3,3])
+                }
+
+                if(length(idx4)!=0){
+                        fprs[idx4]=as.numeric(tp1[idx4,4])
+                }
+
+                scores[i] = as.numeric(as.numeric(fprs) %*% as.matrix(prssnps_chr$beta_grid4))
+        }
+        return(scores)
+}
+
+#Pre-computed
+#scores = mclapply(1:22, function(chr) {calc_prs(vcfs[[chr]], ids, prssnps_chr=prssnps[prssnps$chr == chr, ])}, mc.cores=16)
+#results$PRS.batch.raw = NA
+#for(i in 1:nrow(results)){
+#
+#        results$PRS.batch.raw[i] = sum(unlist(lapply(scores, '[', i)))
+#
+#}
+
+results = read.table("/fh/fast/peters_u/GECCO_Working/robert_working/nextflow/FH-PRS-tool-example/inputQC/23andMe_imputation_stats_w_batch_May8_2025.tsv",
+                     header=T, sep='\t')
+
+ggplot(results, aes(x=PRS.raw, y=PRS.batch.raw, color=chip)) + geom_point(pch=1) + geom_abline(slope=1, intercept=0)
+
+#Correlation of dosage
+cor(results$PRS.raw , results$PRS.batch.raw)
+
+r = results$PRS.raw - results$PRS.batch.raw
+
+#SD by chip
+tapply(r, results$chip, sd)
+
+#Bin missingness
+results$missing.cat = ifelse(results$pct.NA < 0.015, 'low', ifelse(results$pct.NA < 0.025, 'medium', 'high'))
+
+table(results$chip, results$missing.cat)
+
+#SD by missingness
+tapply(r, results$missing.cat, sd)
+
+#Boxplot by chip and missingness
+
+ggplot(results, aes(x=missing.cat, y=R2.mean, fill=chip)) + geom_boxplot()
+
+#Correlation by missingness
+cor(results$PRS.raw[ results$missing.cat == "high"] , results$PRS.batch.raw[results$missing.cat == "high"])
+cor(results$PRS.raw[ results$missing.cat == "low"] , results$PRS.batch.raw[results$missing.cat == "low"])
+cor(results$PRS.raw[ results$missing.cat == "medium"] , results$PRS.batch.raw[results$missing.cat == "medium"])
+
+```
+
+Pearson correlation of single-sample-imputed and batch-imputed exceeds 0.95. 
+
+The standard deviation of the PRS by chip is higher for the 600k and 950k chips 
+and standard deviation of the PRS by missingness is higher for >2.5%. 
 
